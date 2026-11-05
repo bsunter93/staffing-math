@@ -1,0 +1,53 @@
+{
+  "name": "staffing-math",
+  "version": "0.3.0",
+  "description": "An MCP server that gives Claude and ChatGPT exact staffing math: FTE needed, a monthly hiring plan, and Erlang C queue staffing, with the arithmetic shown.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Ben Sunter",
+  "homepage": "https://github.com/bsunter93/staffing-math",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bsunter93/staffing-math"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "staffing",
+    "fte",
+    "headcount",
+    "capacity-planning",
+    "erlang-c",
+    "workforce-planning"
+  ],
+  "bin": {
+    "staffing-math": "dist/staffing-math.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check:vendor": "sh scripts/check-vendor.sh",
+    "start": "node dist/staffing-math.mjs",
+    "start:http": "node dist/staffing-math.mjs --http",
+    "pack": "npx -y @anthropic-ai/mcpb pack . staffing-math.mcpb"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.7.5",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.5",
+    "vitest": "^5.1.0",
+    "zod": "^4.6.7"
+  }
+}

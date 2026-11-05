@@ -1,0 +1,17 @@
+node_modules/
+src/
+tests/
+vendor/
+scripts/
+verification/
+.claude-plugin/
+SPEC.md
+tsconfig.json
+vitest.config.ts
+package-lock.json
+*.mcpb
+gemini-extension.json
+api/
+vercel.json
+.vercelignore
+.vercel/

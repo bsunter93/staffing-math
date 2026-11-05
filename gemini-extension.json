@@ -1,0 +1,14 @@
+{
+  "name": "staffing-math",
+  "version": "0.3.0",
+  "description": "Exact staffing math: FTE needed for a workload, a monthly hiring plan, and Erlang C queue staffing, with the arithmetic shown.",
+  "mcpServers": {
+    "staffing-math": {
+      "command": "node",
+      "args": [
+        "${extensionPath}${/}dist${/}staffing-math.mjs"
+      ],
+      "cwd": "${extensionPath}"
+    }
+  }
+}

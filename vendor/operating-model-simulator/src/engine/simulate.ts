@@ -1,0 +1,688 @@
+/**
+ * The monthly engine. Pure, deterministic, no React.
+ *
+ *   fixture JSON -> run(model, { scenario, interventions }) -> ModelResult
+ *
+ * The atomic unit is team × month. Annual figures are sums of monthly ones.
+ * The input model is never mutated; run() works on a structured clone.
+ */
+import type {
+  DemandStream, Fund, HiringRequest, Intervention, MonthKey, OperatingModel, Scenario, ScenarioEffect, Team,
+} from '../models/types';
+import type {
+  BudgetLever, FundResult, Constraint, Exposure, ExposureItem, FinancialMonth, Financials,
+  FlowEdge, InitiativeSchedule, ModelResult, Summary, TeamMonth, TeamResult, TeamStatus,
+} from '../models/results';
+import { fmtFor } from '../lib/format';
+import { addMonths, annualToMonthlyRate, calendarMonth, expandMonths, monthIndex } from './calendar';
+import { serviceLevel as erlangServiceLevel } from './pooled';
+import { scheduleInitiatives } from './schedule';
+import { assertValid } from './validate';
+
+export interface RunOptions {
+  /** Scenario id from the model, or a Scenario object. Defaults to the base scenario. */
+  scenario?: string | Scenario;
+  /** Intervention ids from the model, or Intervention objects. Applied together. */
+  interventions?: Array<string | Intervention>;
+}
+
+/** Status thresholds. Configurable; these are the defaults from the spec. */
+export const STATUS_BAND_PP = 0.05;
+/** Most attrition can be lifted to, as a multiple of the team's own rate. */
+export const BURNOUT_CAP = 1.0;
+/** How much of last month's strain carries into this month's index. */
+export const BURNOUT_DECAY = 0.65;
+
+export function classify(utilization: number, target: number): TeamStatus {
+  if (utilization > 1) return 'severe';
+  if (utilization > target) return 'constrained';
+  if (utilization >= target - STATUS_BAND_PP) return 'watch';
+  return 'healthy';
+}
+
+const STATUS_RANK: Record<TeamStatus, number> = { healthy: 0, watch: 1, constrained: 2, severe: 3 };
+
+function worse(a: TeamStatus, b: TeamStatus): TeamStatus {
+  return STATUS_RANK[a] >= STATUS_RANK[b] ? a : b;
+}
+
+interface Effective {
+  demandMult: Map<string, number[]>;   // streamId -> multiplier by month index
+  hiringPlan: HiringRequest[];         // after freeze and expedite
+  budgetMult: number;
+  failureMult: number;
+  productivityMult: Map<string, number>; // teamId -> multiplier
+  attritionMult: Map<string, number>;    // teamId -> multiplier
+  targetUtil: Map<string, number>;
+  automationMult: Map<string, number[]>;  // teamId -> multiplier by month
+  reallocDelta: Map<string, number[]>;    // teamId -> FTE delta by month (signed, persistent)
+  changeCost: number[];                   // one-time change costs by month
+  deferrals: Map<string, number>;
+  cancelled: Set<string>;
+  durationMult: Map<string, number>;      // initiativeId -> how much longer it runs
+  fteMult: Map<string, number>;           // initiativeId -> people per month on it
+  valueMult: Map<string, number>;         // initiativeId -> how much of the value survives
+  funds: Fund[];                          // after any shock to what lands, and when
+}
+
+function resolveScenario(model: OperatingModel, s: RunOptions['scenario']): Scenario {
+  if (s === undefined) return model.scenarios.find((x) => x.type === 'base')!;
+  if (typeof s === 'string') {
+    const found = model.scenarios.find((x) => x.id === s);
+    if (!found) throw new Error(`Unknown scenario "${s}"`);
+    return found;
+  }
+  return s;
+}
+
+function resolveInterventions(model: OperatingModel, list: RunOptions['interventions']): Intervention[] {
+  return (list ?? []).map((iv) => {
+    if (typeof iv !== 'string') return iv;
+    const found = model.interventions.find((x) => x.id === iv);
+    if (!found) throw new Error(`Unknown intervention "${iv}"`);
+    return found;
+  });
+}
+
+function buildEffective(model: OperatingModel, scenario: Scenario, interventions: Intervention[], months: MonthKey[]): Effective {
+  const n = months.length;
+  const start = model.calendar.startMonth;
+  const idx = (k: MonthKey) => monthIndex(start, k);
+  const eff: Effective = {
+    demandMult: new Map(model.demandStreams.map((s) => [s.id, new Array(n).fill(1)])),
+    hiringPlan: model.hiringPlan.map((h) => ({ ...h })),
+    budgetMult: 1,
+    failureMult: 1,
+    productivityMult: new Map(model.teams.map((t) => [t.id, 1])),
+    attritionMult: new Map(model.teams.map((t) => [t.id, 1])),
+    targetUtil: new Map(model.teams.map((t) => [t.id, t.targetUtilization])),
+    automationMult: new Map(model.teams.map((t) => [t.id, new Array(n).fill(1)])),
+    reallocDelta: new Map(model.teams.map((t) => [t.id, new Array(n).fill(0)])),
+    changeCost: new Array(n).fill(0),
+    funds: (model.funds ?? []).map((f) => ({ ...f })),
+    deferrals: new Map(),
+    cancelled: new Set(),
+    durationMult: new Map(),
+    fteMult: new Map(),
+    valueMult: new Map(),
+  };
+
+  const apply = (e: ScenarioEffect) => {
+    switch (e.type) {
+      case 'demandMultiplier': {
+        const from = e.fromMonth ? Math.max(0, idx(e.fromMonth)) : 0;
+        for (const [sid, arr] of eff.demandMult) {
+          if (e.streamIds && !e.streamIds.includes(sid)) continue;
+          for (let m = from; m < n; m++) arr[m] *= e.demandMultiplier;
+        }
+        break;
+      }
+      case 'hiringFreeze': {
+        const from = e.fromMonth ? idx(e.fromMonth) : 0;
+        // Requests made before the freeze are in flight and complete; the rest are cancelled.
+        eff.hiringPlan = eff.hiringPlan.filter((h) => idx(h.requestMonth) < from);
+        break;
+      }
+      case 'budgetConstraint': eff.budgetMult *= e.budgetMultiplier; break;
+      case 'failureProbabilityMultiplier': eff.failureMult *= e.multiplier; break;
+      case 'productivityMultiplier':
+        for (const [tid, v] of eff.productivityMult) if (!e.teamIds || e.teamIds.includes(tid)) eff.productivityMult.set(tid, v * e.multiplier);
+        break;
+      case 'attritionMultiplier':
+        for (const [tid, v] of eff.attritionMult) if (!e.teamIds || e.teamIds.includes(tid)) eff.attritionMult.set(tid, v * e.multiplier);
+        break;
+      case 'fundingShock':
+        for (const f of eff.funds) {
+          if (e.fundIds && !e.fundIds.includes(f.id)) continue;
+          if (e.fundMultiplier !== undefined) f.amount *= e.fundMultiplier;
+          // A tranche that lands late is money you have on paper and cannot spend yet,
+          // which is a different problem from having less of it, and usually a worse one.
+          if (e.delayMonths) f.fromMonth = addMonths(f.fromMonth ?? months[0], e.delayMonths);
+        }
+        break;
+    }
+  };
+  if (scenario.type === 'combined') scenario.effects.forEach(apply);
+  else if (scenario.type !== 'base') apply(scenario);
+
+  for (const iv of interventions) {
+    const s0 = iv.startMonth ? Math.max(0, idx(iv.startMonth)) : 0;
+    switch (iv.type) {
+      case 'expediteHiring': {
+        const h = eff.hiringPlan.find((x) => x.id === iv.hiringRequestId);
+        if (h) { h.leadTimeMonths = iv.newLeadTimeMonths; if (s0 < n) eff.changeCost[s0] += iv.oneTimeCost; }
+        break;
+      }
+      case 'hire': {
+        eff.hiringPlan.push({ id: `${iv.id}:hire`, teamId: iv.teamId, requestMonth: addMonths(start, s0), headcount: iv.headcount, leadTimeMonths: iv.leadTimeMonths });
+        if (s0 < n) eff.changeCost[s0] += iv.recruitingCostPerHead * iv.headcount;
+        break;
+      }
+      case 'automation': {
+        const arr = eff.automationMult.get(iv.teamId)!;
+        for (let m = s0 + iv.timeToImpactMonths; m < n; m++) arr[m] *= 1 - iv.workloadReductionRate;
+        if (s0 < n) eff.changeCost[s0] += iv.implementationCost;
+        break;
+      }
+      case 'reallocation': {
+        const from = eff.reallocDelta.get(iv.fromTeamId)!, to = eff.reallocDelta.get(iv.toTeamId)!;
+        const m0 = s0 + iv.timeToImpactMonths;
+        if (m0 < n) { from[m0] -= iv.headcount; to[m0] += iv.headcount; }
+        if (s0 < n) eff.changeCost[s0] += iv.implementationCost;
+        break;
+      }
+      case 'defer': eff.deferrals.set(iv.initiativeId, (eff.deferrals.get(iv.initiativeId) ?? 0) + iv.months); break;
+      case 'cancel': eff.cancelled.add(iv.initiativeId); break;
+      case 'restaff': {
+        const id = iv.initiativeId;
+        eff.durationMult.set(id, (eff.durationMult.get(id) ?? 1) * iv.durationMultiplier);
+        eff.fteMult.set(id, (eff.fteMult.get(id) ?? 1) * iv.fteMultiplier);
+        if (iv.valueMultiplier !== undefined)
+          eff.valueMult.set(id, (eff.valueMult.get(id) ?? 1) * iv.valueMultiplier);
+        if (iv.oneTimeCost) eff.changeCost[0] += iv.oneTimeCost;
+        break;
+      }
+      case 'rescope': {
+        // Less of the thing: fewer people on it, and proportionally less of what it earns.
+        const id = iv.initiativeId;
+        eff.fteMult.set(id, (eff.fteMult.get(id) ?? 1) * iv.scopeMultiplier);
+        eff.valueMult.set(id, (eff.valueMult.get(id) ?? 1) * iv.scopeMultiplier);
+        break;
+      }
+      case 'serviceLevelChange': eff.targetUtil.set(iv.teamId, iv.newTargetUtilization); break;
+    }
+  }
+  return eff;
+}
+
+/** Normalized seasonality share for each month of the horizon, per stream. */
+function seasonShares(model: OperatingModel, stream: DemandStream, months: MonthKey[]): number[] {
+  const profile = stream.seasonality === 'default' ? model.seasonality : stream.seasonality;
+  const byCalMonth = new Map<number, number>();
+  for (const [k, v] of Object.entries(profile)) byCalMonth.set(calendarMonth(k), v);
+  const total = [...byCalMonth.values()].reduce((a, b) => a + b, 0);
+  return months.map((k) => (total > 0 ? byCalMonth.get(calendarMonth(k))! / total : 0));
+}
+
+export function run(input: OperatingModel, opts: RunOptions = {}): ModelResult {
+  assertValid(input);
+  const model: OperatingModel = structuredClone(input);
+  const scenario = resolveScenario(model, opts.scenario);
+  const interventions = resolveInterventions(model, opts.interventions);
+  const months = expandMonths(model.calendar.startMonth, model.calendar.endMonth);
+  const n = months.length;
+  const eff = buildEffective(model, scenario, interventions, months);
+  const teams = new Map(model.teams.map((t) => [t.id, t]));
+  const hours = model.calendar.workHoursPerFteMonth;
+
+  // 1. Initiative schedule with dependency propagation.
+  /* Restaffing changes how long an initiative runs, so the scheduler has to be given the
+     adjusted initiative rather than the authored one. Duration is rounded to whole months
+     and floored at one: half a month of an initiative is not a thing this model has. */
+  const scheduledInitiatives = model.initiatives.map((i) => {
+    const dm = eff.durationMult.get(i.id);
+    return dm && dm !== 1
+      ? { ...i, durationMonths: Math.max(1, Math.round(i.durationMonths * dm)) }
+      : i;
+  });
+  const schedule = scheduleInitiatives({
+    horizonStart: model.calendar.startMonth, horizonMonths: n,
+    initiatives: scheduledInitiatives, dependencies: model.dependencies,
+    deferrals: eff.deferrals, cancelled: eff.cancelled,
+  });
+  const initById = new Map(model.initiatives.map((i) => [i.id, i]));
+
+  // 2. Run workload hours per team-month (demand streams).
+  const runHours = new Map<string, number[]>(model.teams.map((t) => [t.id, new Array(n).fill(0)]));
+  /* The same numbers, kept rather than summed away. Every arrow the app can draw is a
+     by-product of arithmetic this loop was doing anyway. */
+  const flow: FlowEdge[] = [];
+  for (const s of model.demandStreams) {
+    const shares = seasonShares(model, s, months);
+    const arr = runHours.get(s.teamId)!;
+    const auto = eff.automationMult.get(s.teamId)!;
+    const dm = eff.demandMult.get(s.id)!;
+    const prod = eff.productivityMult.get(s.teamId)!;
+    const units = new Array(n).fill(0);
+    const hrs = new Array(n).fill(0);
+    for (let m = 0; m < n; m++) {
+      const volume = s.annualVolume * shares[m] * dm[m];
+      const h = (volume * s.handlingMinutesPerUnit * s.complexityFactor / 60) * auto[m] / prod;
+      arr[m] += h;
+      units[m] = volume;
+      hrs[m] = h;
+    }
+    flow.push({
+      id: `arrival:${s.id}`, kind: 'arrival', sourceId: s.id, toTeamId: s.teamId,
+      label: s.name, unit: s.unit, share: 1, unitsByMonth: units, hoursByMonth: hrs,
+    });
+  }
+
+  // 2b. Routed work: hours one team creates for another by escalating or handing off.
+  //     The share comes off the upstream units AFTER automation, because a case that
+  //     self-service resolved is a case nobody escalates. This is the only mechanism by
+  //     which making one team faster changes what another team sees.
+  const streamById = new Map(model.demandStreams.map((s) => [s.id, s]));
+  for (const r of model.routes ?? []) {
+    const up = streamById.get(r.fromStreamId);
+    if (!up) continue;
+    const arr = runHours.get(r.toTeamId);
+    if (!arr) continue;
+    const shares = seasonShares(model, up, months);
+    const auto = eff.automationMult.get(up.teamId)!;
+    const dm = eff.demandMult.get(up.id)!;
+    const toProd = eff.productivityMult.get(r.toTeamId)!;
+    const routed = new Array(n).fill(0);
+    const hrs = new Array(n).fill(0);
+    for (let m = 0; m < n; m++) {
+      const upstreamUnits = up.annualVolume * shares[m] * dm[m] * auto[m];
+      const units = upstreamUnits * r.share;
+      const h = (units * r.handlingMinutesPerUnit * (r.complexityFactor ?? 1) / 60) / toProd;
+      arr[m] += h;
+      routed[m] = units;
+      hrs[m] = h;
+    }
+    flow.push({
+      id: `route:${r.id}`, kind: 'route', sourceId: up.teamId, viaStreamId: up.id,
+      toTeamId: r.toTeamId, label: r.name, unit: up.unit, share: r.share,
+      unitsByMonth: routed, hoursByMonth: hrs,
+    });
+  }
+
+  // 3. Portfolio hours per team-month: assigned FTE × that team's productive hours.
+  const productivePerFte = (t: Team) => hours * (1 - t.shrinkage);
+  const portfolioHours = new Map<string, number[]>(model.teams.map((t) => [t.id, new Array(n).fill(0)]));
+  for (const sch of schedule) {
+    if (sch.status === 'cancelled') continue;
+    const init = initById.get(sch.initiativeId)!;
+    const fm = eff.fteMult.get(init.id) ?? 1;
+    for (const [tid, fte] of Object.entries(init.requiredFteByTeam)) {
+      const arr = portfolioHours.get(tid)!;
+      const t = teams.get(tid)!;
+      for (const m of sch.activeMonthIndexes) arr[m] += fte * fm * productivePerFte(t);
+    }
+  }
+
+  // 4. Workforce and capacity per team-month.
+  const landingFrom = (plan: typeof eff.hiringPlan) => {
+    const map = new Map<string, number[]>(model.teams.map((t) => [t.id, new Array(n).fill(0)]));
+    for (const h of plan) {
+      const m = monthIndex(model.calendar.startMonth, h.requestMonth) + h.leadTimeMonths;
+      if (m >= 0 && m < n) map.get(h.teamId)![m] += h.headcount;
+    }
+    return map;
+  };
+
+  /* Only work that queues gets a service level. A team's target and handling time come
+     from its own demand streams; a team whose streams state no target is left out rather
+     than handed a number that means nothing. Where a team has several queueing streams,
+     handling time is weighted by how much work each brings. */
+  const queueOf = (teamId: string) => {
+    const qs = model.demandStreams.filter((s) => s.teamId === teamId && s.answerWithinSeconds);
+    if (qs.length === 0) return null;
+    const load = (s: typeof qs[number]) => s.annualVolume * s.handlingMinutesPerUnit;
+    const total = qs.reduce((a, s) => a + load(s), 0) || 1;
+    return {
+      ahtSeconds: qs.reduce((a, s) => a + s.handlingMinutesPerUnit * 60 * load(s), 0) / total,
+      targetSeconds: qs.reduce((a, s) => a + (s.answerWithinSeconds ?? 0) * load(s), 0) / total,
+    };
+  };
+
+  const rowsFor = (t: Team, landing: Map<string, number[]>): TeamMonth[] => {
+    const queue = queueOf(t.id);
+    const ma = annualToMonthlyRate(Math.min(0.99, t.annualAttrition * eff.attritionMult.get(t.id)!));
+    const burnout = t.burnoutSensitivity ?? 0;
+    /* Pressure that has been building for months costs people; one hard month does not.
+       Smoothed, so it is sustained strain that bites, and capped so the loop converges. */
+    let strainIdx = 0;
+    // Work waiting from the months before this one. Zero for a team with no backlog policy,
+    // which keeps every model that predates this behaving exactly as it did.
+    const carry = t.backlog?.carryForward ?? 0;
+    let waiting = 0;
+    const prod = productivePerFte(t);
+    const target = eff.targetUtil.get(t.id)!;
+    const rows: TeamMonth[] = [];
+    let fte = t.currentFte;
+    let realloc = 0;
+    for (let m = 0; m < n; m++) {
+      const starting = fte;
+      // Last month's strain drives this month's leavers: people resign after the bad
+      // month, not during it, and a same-month link would be circular.
+      const maEff = burnout > 0
+        ? Math.min(0.99, ma * (1 + burnout * Math.min(BURNOUT_CAP, strainIdx)))
+        : ma;
+      const loss = starting * maEff;
+      const landed = landing.get(t.id)![m];
+      realloc += eff.reallocDelta.get(t.id)![m];
+      const available = Math.max(0, starting - loss + landed + eff.reallocDelta.get(t.id)![m]);
+      const availProd = available * prod;
+      const targetCap = availProd * target;
+      const rh = runHours.get(t.id)![m];
+      const ph = portfolioHours.get(t.id)![m];
+      const carriedIn = waiting;
+      // What is in front of them: what arrived, plus what is still waiting from before.
+      const work = rh + ph + carriedIn;
+      const util = availProd > 0 ? work / availProd : (work > 0 ? Infinity : 0);
+      const gap = Math.max(0, work - targetCap);
+      const gapVsPlan = Math.max(0, work - availProd * t.targetUtilization);
+      const required = prod * target > 0 ? work / (prod * target) : 0;
+      /* Anything they could not reach either waits for next month or is gone. A month of
+         hours is the most that can be waiting at once: past that the queue is not a
+         backlog any more, it is a team that needs a different plan, and the model should
+         not pretend a number that large is still being worked through. Whatever the
+         policy declines, plus whatever overflows that ceiling, is shed, so that
+         work = done + carried + shed exactly and nothing quietly disappears. */
+      const unserved = Math.max(0, work - availProd);
+      const carriedOut = Math.min(unserved * carry, availProd);
+      rows.push({
+        teamId: t.id, month: months[m], monthIndex: m,
+        startingFte: starting, attritionLoss: loss, hiresLanded: landed, reallocated: realloc,
+        availableFte: available, productiveHoursPerFte: prod, availableProductiveHours: availProd,
+        targetCapacityHours: targetCap, runHours: rh, portfolioHours: ph, workloadHours: work,
+        utilization: util, targetUtilization: target, gapHours: gap, gapVsPlanHours: gapVsPlan, requiredFte: required,
+        workforceGap: Math.max(0, required - available),
+        status: classify(util, target), runCost: available * t.monthlyFteCost,
+        // n servers against an offered load of `a` person-equivalents, so a/n is exactly
+        // utilisation and the team's size still changes the answer.
+        carriedInHours: carriedIn,
+        unservedHours: unserved,
+        carriedOutHours: carriedOut,
+        shedHours: unserved - carriedOut,
+        serviceLevel: queue && prod > 0
+          ? erlangServiceLevel(available, work / prod, queue.ahtSeconds, queue.targetSeconds)
+          : null,
+      });
+      waiting = carriedOut;
+
+      // Feed this month's overage into the index the next month reads.
+      const overShare = util > target ? (util - target) / Math.max(0.05, 1 - target) : 0;
+      strainIdx = strainIdx * BURNOUT_DECAY + Math.min(1, overShare) * (1 - BURNOUT_DECAY);
+      fte = available;
+    }
+    return rows;
+  };
+
+  /*
+   * A conditional hire is judged against a year run WITHOUT it, because a hire that is
+   * only justified by having been made is not a decision. One pass decides, the second
+   * pass is the answer. Dropped requests are reported so the reason is visible rather
+   * than inferred from a headcount that quietly went missing.
+   */
+  const conditional = eff.hiringPlan.filter((h) => h.cancelIfSlack);
+  const hiresDropped: string[] = [];
+  if (conditional.length > 0) {
+    const provisional = landingFrom(eff.hiringPlan.filter((h) => !h.cancelIfSlack));
+    for (const h of conditional) {
+      const t = teams.get(h.teamId);
+      if (!t) continue;
+      const rows = rowsFor(t, provisional);
+      const from = monthIndex(model.calendar.startMonth, h.requestMonth) + h.leadTimeMonths;
+      // Named for what it is, and not `window`: this file must stay free of the DOM, and
+      // a local shadowing the one global that would prove otherwise is a bad place to look.
+      const span = rows.slice(Math.max(0, from), Math.max(0, from) + h.cancelIfSlack!.months);
+      if (span.length > 0 && span.every((r) => r.utilization < h.cancelIfSlack!.belowUtilization)) {
+        hiresDropped.push(h.id);
+      }
+    }
+  }
+  const landing = landingFrom(eff.hiringPlan.filter((h) => !hiresDropped.includes(h.id)));
+
+  const teamResults: TeamResult[] = [];
+  for (const t of model.teams) {
+    const rows = rowsFor(t, landing);
+    const peak = rows.reduce((a, b) => (b.utilization > a.utilization ? b : a), rows[0]);
+    const constrained = rows.filter((r) => STATUS_RANK[r.status] >= 2);
+    teamResults.push({
+      teamId: t.id, months: rows,
+      peakUtilization: peak.utilization, peakMonth: peak.month,
+      monthsConstrained: constrained.length,
+      firstConstrainedMonth: constrained[0]?.month ?? null,
+      totalGapHours: rows.reduce((s, r) => s + r.gapHours, 0),
+      totalGapVsPlanHours: rows.reduce((s, r) => s + r.gapVsPlanHours, 0),
+      peakWorkforceGap: Math.max(...rows.map((r) => r.workforceGap)),
+      worstStatus: rows.reduce<TeamStatus>((s, r) => worse(s, r.status), 'healthy'),
+      annualWorkloadHours: rows.reduce((s, r) => s + r.workloadHours, 0),
+      annualTargetCapacityHours: rows.reduce((s, r) => s + r.targetCapacityHours, 0),
+      annualRunCost: rows.reduce((s, r) => s + r.runCost, 0),
+      startingFte: rows[0].startingFte, endingFte: rows[n - 1].availableFte,
+    });
+  }
+  const teamResultById = new Map(teamResults.map((r) => [r.teamId, r]));
+
+  // 5. Financials.
+  const monthlyBudget = (model.budget.modeledAnnualBudget / 12) * eff.budgetMult;
+  const fin: FinancialMonth[] = months.map((k, m) => {
+    const runCost = teamResults.reduce((s, r) => s + r.months[m].runCost, 0);
+    const change = eff.changeCost[m];
+    return { month: k, runCost: runCost, changeCost: change, totalCost: runCost + change, budgetCap: monthlyBudget, variance: runCost + change - monthlyBudget };
+  });
+  /*
+   * Restricted income, if this organisation lives on it.
+   *
+   * Each fund is a pot with a purpose. Costs are charged to whatever is allowed to pay
+   * for them, restricted money first, because unrestricted is the only money that can pay
+   * for anything and is therefore the thing to protect. What no fund may cover is
+   * unfunded: real cost with no income behind it. What a restricted fund still holds at
+   * the end is stranded: real money that nothing short was allowed to spend.
+   *
+   * One-off change spend goes to unrestricted only. A grant for water points does not pay
+   * for reorganising the rota, and pretending otherwise would make the one lever that
+   * actually hurts look free.
+   */
+  const byFund: FundResult[] = [];
+  let unfundedCost = 0;
+  if (eff.funds.length) {
+    const pots = eff.funds.map((f) => ({
+      f,
+      left: f.amount,
+      spent: 0,
+      from: f.fromMonth ? monthIndex(model.calendar.startMonth, f.fromMonth) : 0,
+      to: f.toMonth ? monthIndex(model.calendar.startMonth, f.toMonth) : n - 1,
+    }));
+    const allows = (p: (typeof pots)[number], teamId: string | null) => {
+      const r = p.f.restrictedTo;
+      if (!r) return true;
+      return teamId !== null && (r.teamIds ?? []).includes(teamId);
+    };
+    const charge = (amount: number, teamId: string | null, m: number) => {
+      let left = amount;
+      const open = pots
+        .filter((p) => m >= p.from && m <= p.to && p.left > 0 && allows(p, teamId))
+        .sort((a, b) => Number(!a.f.restrictedTo) - Number(!b.f.restrictedTo));
+      for (const p of open) {
+        if (left <= 0) break;
+        const take = Math.min(left, p.left);
+        p.left -= take; p.spent += take; left -= take;
+      }
+      unfundedCost += left;
+    };
+    for (let m = 0; m < n; m++) {
+      for (const t of teamResults) charge(t.months[m].runCost, t.teamId, m);
+      charge(eff.changeCost[m], null, m);
+    }
+    for (const p of pots) {
+      byFund.push({
+        fundId: p.f.id, name: p.f.name, restricted: !!p.f.restrictedTo,
+        amount: p.f.amount, spent: p.spent,
+        stranded: p.f.restrictedTo ? p.left : 0,
+      });
+    }
+  }
+
+  const budgetLevers: BudgetLever[] = [];
+  for (const h of eff.hiringPlan) {
+    const m = monthIndex(model.calendar.startMonth, h.requestMonth) + h.leadTimeMonths;
+    if (m >= n) continue;
+    const t = teams.get(h.teamId)!;
+    const remaining = n - Math.max(0, m);
+    budgetLevers.push({ kind: 'cancel-unstarted-hire', id: h.id, label: `Cancel ${h.headcount} ${t.name} hires`, cashReleased: h.headcount * t.monthlyFteCost * remaining, fteMonthsReleased: h.headcount * remaining });
+  }
+  for (const sch of schedule) {
+    const init = initById.get(sch.initiativeId)!;
+    if (!init.discretionary || sch.status === 'cancelled') continue;
+    const fteMonths = sch.activeMonthIndexes.length * Object.values(init.requiredFteByTeam).reduce((a, b) => a + b, 0);
+    budgetLevers.push({ kind: 'defer-discretionary-initiative', id: init.id, label: `Defer ${init.name}`, cashReleased: 0, fteMonthsReleased: fteMonths });
+  }
+  const financials: Financials = {
+    monthly: fin,
+    byFund,
+    annualRunCost: fin.reduce((s, f) => s + f.runCost, 0),
+    annualChangeCost: fin.reduce((s, f) => s + f.changeCost, 0),
+    annualTotalCost: fin.reduce((s, f) => s + f.totalCost, 0),
+    annualBudget: monthlyBudget * n,
+    annualVariance: fin.reduce((s, f) => s + f.variance, 0),
+    peakMonthlyVariance: Math.max(...fin.map((f) => f.variance)),
+    budgetLevers,
+  };
+
+  // 6. Revenue exposure. Capacity shortfall raises the failure probability on
+  //    the remaining headroom: p_eff = 1 - (1 - p)(1 - shortfall). Shortfall is
+  //    measured against the plan's target so a relabeled target changes nothing.
+  const items: ExposureItem[] = [];
+  for (const sch of schedule) {
+    if (sch.status === 'cancelled') continue;
+    const init = initById.get(sch.initiativeId)!;
+    const vm = eff.valueMult.get(init.id) ?? 1;
+    if (init.revenueAtRisk * vm <= 0) continue;
+    const p = Math.min(1, init.executionFailureProbability * eff.failureMult);
+    let shortfall = 0;
+    for (const tid of Object.keys(init.requiredFteByTeam)) {
+      const tr = teamResultById.get(tid)!;
+      for (const m of sch.activeMonthIndexes) {
+        const row = tr.months[m];
+        if (row.workloadHours > 0) shortfall = Math.max(shortfall, Math.min(1, row.gapVsPlanHours / row.workloadHours));
+      }
+    }
+    const pEff = 1 - (1 - p) * (1 - shortfall);
+    items.push({ initiativeId: init.id, revenueAtRisk: init.revenueAtRisk * vm, baseProbability: init.executionFailureProbability, scenarioProbability: p, capacityShortfall: shortfall, effectiveProbability: pEff, exposure: init.revenueAtRisk * vm * pEff });
+  }
+  const exposure: Exposure = { items, total: items.reduce((s, i) => s + i.exposure, 0) };
+
+  // 7. Constraints, ranked by dollar impact.
+  const constraints = detectConstraints(model, teamResults, schedule, financials, months);
+
+  // 8. Summary.
+  const allRows = teamResults.flatMap((r) => r.months);
+  const peakGapRow = allRows.reduce((a, b) => (b.gapHours > a.gapHours ? b : a), allRows[0]);
+  const firstBreak = allRows.filter((r) => STATUS_RANK[r.status] >= 2).sort((a, b) => a.monthIndex - b.monthIndex || b.utilization - a.utilization)[0];
+  const totalTarget = teamResults.reduce((s, r) => s + r.annualTargetCapacityHours, 0);
+  const totalPortfolio = allRows.reduce((s, r) => s + r.portfolioHours, 0);
+  const summary: Summary = {
+    startingFte: teamResults.reduce((s, r) => s + r.startingFte, 0),
+    endingFte: teamResults.reduce((s, r) => s + r.endingFte, 0),
+    teamsConstrained: teamResults.filter((r) => STATUS_RANK[r.worstStatus] >= 2).length,
+    teamsWatch: teamResults.filter((r) => r.worstStatus === 'watch').length,
+    peakGapHours: peakGapRow?.gapHours ?? 0,
+    peakGapMonth: peakGapRow && peakGapRow.gapHours > 0 ? peakGapRow.month : null,
+    firstBreakMonth: firstBreak?.month ?? null,
+    firstBreakTeamId: firstBreak?.teamId ?? null,
+    portfolioLoad: totalTarget > 0 ? totalPortfolio / totalTarget : 0,
+    annualTotalCost: financials.annualTotalCost,
+    annualBudgetVariance: financials.annualVariance,
+    revenueExposure: exposure.total,
+    initiativesDelayed: schedule.filter((s) => s.delayMonths > 0).length,
+    peopleLostToAttrition: teamResults.reduce((a, t) => a + t.months.reduce((b, m) => b + m.attritionLoss, 0), 0),
+    unfundedCost,
+    strandedFunds: byFund.reduce((a2, f) => a2 + f.stranded, 0),
+    closingBacklogHours: teamResults.reduce(
+      (a, t) => a + t.months[t.months.length - 1].carriedOutHours, 0),
+    shedHours: teamResults.reduce((a, t) => a + t.months.reduce((b, m) => b + m.shedHours, 0), 0),
+    ...(() => {
+      // Weighted by workload, because a bad month on the biggest queue matters more than a
+      // bad month on a small one. The worst single month is carried separately: an average
+      // of 95% can hide a month where nobody could reach anybody.
+      const rows = teamResults.flatMap((t) => t.months).filter((m) => m.serviceLevel !== null);
+      if (rows.length === 0) {
+        return { serviceLevelPct: null, worstServiceLevel: null, worstServiceMonth: null };
+      }
+      const den = rows.reduce((a, m) => a + m.workloadHours, 0);
+      const worst = rows.reduce((a, b) => (b.serviceLevel! < a.serviceLevel! ? b : a), rows[0]);
+      return {
+        serviceLevelPct: den > 0 ? rows.reduce((a, m) => a + m.serviceLevel! * m.workloadHours, 0) / den : 1,
+        worstServiceLevel: worst.serviceLevel,
+        worstServiceMonth: worst.month,
+      };
+    })(),
+    retentionRate: (() => {
+      const start = model.teams.reduce((a, t) => a + t.currentFte, 0);
+      const lost = teamResults.reduce((a, t) => a + t.months.reduce((b, m) => b + m.attritionLoss, 0), 0);
+      return start > 0 ? Math.max(0, 1 - lost / start) : 1;
+    })(),
+    strainMonths: teamResults.reduce((a, t) => a + t.months.filter((m) => m.utilization > m.targetUtilization).length, 0),
+    // "Customer-facing" is the operational teams: the ones whose work is somebody's request
+    // waiting. Portfolio teams running hot is bad for the plan, not for a customer.
+    customerFacingStrainMonths: teamResults.reduce((a, t) => {
+      const team = model.teams.find((x) => x.id === t.teamId);
+      return team?.teamType !== 'operational' ? a
+        : a + t.months.filter((m) => m.utilization > m.targetUtilization).length;
+    }, 0),
+    portfolioValue: model.initiatives
+      .filter((i) => !eff.cancelled.has(i.id))
+      .reduce((a, i) => a + i.financialValue * (eff.valueMult.get(i.id) ?? 1), 0),
+    hiresDropped,
+    hiresDroppedFte: eff.hiringPlan
+      .filter((h) => hiresDropped.includes(h.id))
+      .reduce((a, h) => a + h.headcount, 0),
+  };
+
+  return {
+    modelId: model.id, scenarioId: scenario.id, interventionIds: interventions.map((i) => i.id),
+    months, teams: teamResults, flow, initiatives: schedule, constraints, financials, exposure, summary,
+  };
+}
+
+function detectConstraints(model: OperatingModel, teams: TeamResult[], schedule: InitiativeSchedule[], fin: Financials, months: MonthKey[]): Constraint[] {
+  /* Bound to the model, not to the host: a pure function whose output changes with the
+     machine's locale is not a pure function, and these strings are shown to a reader. */
+  const f = fmtFor(model);
+  const out: Constraint[] = [];
+  const teamById = new Map(model.teams.map((t) => [t.id, t]));
+  const initById = new Map(model.initiatives.map((i) => [i.id, i]));
+
+  for (const r of teams) {
+    if (STATUS_RANK[r.worstStatus] < 2) continue;
+    const t = teamById.get(r.teamId)!;
+    const prod = r.months[0].productiveHoursPerFte;
+    // Cost of the missing hours at this team's loaded rate.
+    const impact = prod > 0 ? (r.totalGapHours / prod) * t.monthlyFteCost : 0;
+    out.push({
+      id: `capacity:${r.teamId}`, kind: 'capacity', teamId: r.teamId,
+      title: `${t.name} over capacity`,
+      detail: `${r.monthsConstrained} of ${months.length} months over capacity against a ${Math.round(r.months[0].targetUtilization * 100)}% target; peak ${Math.round(r.peakUtilization * 100)}% in ${r.peakMonth}; ${f.num(r.totalGapHours)} gap hours; peak shortfall ${r.peakWorkforceGap.toFixed(1)} FTE.`,
+      businessImpact: impact, firstMonth: r.firstConstrainedMonth,
+      metric: 'peak utilization', value: r.peakUtilization, threshold: r.months[0].targetUtilization,
+    });
+  }
+  for (const s of schedule) {
+    if (s.delayMonths <= 0 || !s.pushedBy) continue;
+    const init = initById.get(s.initiativeId)!;
+    const pred = initById.get(s.pushedBy.predecessorId)!;
+    out.push({
+      id: `sequencing:${s.initiativeId}`, kind: 'sequencing', initiativeId: s.initiativeId,
+      title: `${init.name} cannot start when planned`,
+      detail: `Planned ${s.plannedStart}, earliest feasible ${s.effectiveStart}: it depends on ${pred.name}, which finishes ${schedule.find((x) => x.initiativeId === pred.id)!.completion}.${s.truncated ? ' It now runs past the planning horizon.' : ''}`,
+      businessImpact: init.revenueAtRisk * Math.min(1, s.delayMonths / init.durationMonths),
+      firstMonth: s.plannedStart, metric: 'delay months', value: s.delayMonths, threshold: 0,
+    });
+  }
+  for (const s of schedule) {
+    if (!s.truncated || (s.delayMonths > 0 && s.pushedBy)) continue;
+    const init = initById.get(s.initiativeId)!;
+    out.push({
+      id: `horizon:${s.initiativeId}`, kind: 'horizon', initiativeId: s.initiativeId,
+      title: `${init.name} runs past the horizon`,
+      detail: `Completes ${s.completion}, after the plan ends ${months[months.length - 1]}.`,
+      businessImpact: 0, firstMonth: s.effectiveStart, metric: 'completion', value: 0, threshold: 0,
+    });
+  }
+  if (fin.annualVariance > 0) {
+    out.push({
+      id: 'budget', kind: 'budget',
+      title: 'Modeled cost exceeds the budget cap',
+      detail: `${f.money(fin.annualVariance, { compact: false })} over across the horizon; peak monthly overage ${f.money(fin.peakMonthlyVariance, { compact: false })}.`,
+      businessImpact: fin.annualVariance, firstMonth: fin.monthly.find((f) => f.variance > 0)?.month ?? null,
+      metric: 'annual variance', value: fin.annualVariance, threshold: 0,
+    });
+  }
+  return out.sort((a, b) => b.businessImpact - a.businessImpact);
+}

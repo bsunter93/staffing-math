@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "echo nothing to install",
+  "buildCommand": "mkdir -p public && echo 'User-agent: *' > public/robots.txt",
+  "outputDirectory": "public",
+  "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
+  "functions": { "api/index.mjs": { "maxDuration": 30 } }
+}

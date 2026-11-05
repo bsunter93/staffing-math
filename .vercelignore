@@ -1,0 +1,5 @@
+# Upload only the bundled function and its routing. Without a package.json Vercel installs
+# and builds nothing, so what runs is exactly the api/index.mjs the tests checked.
+/*
+!/api
+!/vercel.json

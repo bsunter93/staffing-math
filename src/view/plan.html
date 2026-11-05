@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hiring plan</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --ink: var(--color-text-primary, light-dark(#1d2125, #ecebe8));
+    --muted: var(--color-text-secondary, light-dark(#5b6168, #aba79f));
+    --rule: var(--color-border-secondary, light-dark(#dcd8d0, #3e3c38));
+    --ground: var(--color-background-primary, light-dark(#ffffff, #1e1e1d));
+    --panel: var(--color-background-secondary, light-dark(#f5f3ef, #282826));
+    --onhand: light-dark(#1f6a85, #6cb8d4);
+    --onhand-fill: light-dark(rgba(31, 106, 133, 0.13), rgba(108, 184, 212, 0.16));
+    --short: light-dark(#b1401c, #ee8459);
+    --req: light-dark(#8b9099, #8e8a83);
+    --focus: light-dark(rgba(29, 33, 37, 0.06), rgba(236, 235, 232, 0.07));
+    --ring: light-dark(#1f6a85, #6cb8d4);
+    --sans: var(--font-sans, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif);
+    --mono: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; }
+  body { font: 14px/1.45 var(--sans); color: var(--ink); }
+  main { padding: 16px 16px 12px; max-width: 800px; }
+  .eyebrow { margin: 0 0 2px; font: 600 11px/1.2 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  h1 { margin: 0; font-size: 20px; line-height: 1.25; font-weight: 650; }
+  #sub { margin: 4px 0 10px; color: var(--muted); }
+  figure { margin: 0; }
+  #chart { display: block; width: 100%; height: auto; border-radius: 6px; }
+  #chart:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  #tip { min-height: 1.45em; margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+  .grid { stroke: var(--rule); stroke-width: 1; }
+  .tick { fill: var(--muted); font: 11px var(--sans); }
+  .axis-name { fill: var(--muted); font: 600 10px var(--mono); letter-spacing: .08em; }
+  .onhand-line { fill: none; stroke: var(--onhand); stroke-width: 2; }
+  .needed-line { fill: none; stroke: var(--ink); stroke-width: 2; stroke-dasharray: 5 3; }
+  .gap { fill: url(#hatch); stroke: var(--short); stroke-width: 1; }
+  .spare { fill: var(--onhand-fill); }
+  .spare-label { fill: var(--onhand); font: 600 11px var(--sans); }
+  .gap-bg { fill: transparent; }
+  .gap-line { stroke: var(--short); stroke-width: 2; }
+  .gap-label { fill: var(--short); font: 600 11px var(--sans); }
+  .end { font: 600 12px var(--sans); }
+  .end.needed { fill: var(--ink); }
+  .end.onhand { fill: var(--onhand); }
+  .end.muted { fill: var(--muted); font-weight: 400; font-size: 11px; }
+  .req { fill: var(--req); }
+  .req-label { fill: var(--ink); font: 600 11px var(--sans); }
+  .focus-col { fill: var(--focus); }
+  .hit { fill: transparent; cursor: crosshair; }
+  body.busy #chart, body.busy #headline, body.busy #sub { opacity: .45; transition: opacity .15s; }
+  #controls { margin-top: 14px; padding: 12px 14px; background: var(--panel); border-radius: 8px; }
+  #controls h2 { margin: 0 0 8px; font-size: 14px; font-weight: 650; }
+  #control-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(230px, 100%), 1fr)); gap: 6px 18px; }
+  .control { display: grid; grid-template-columns: 1fr auto; grid-template-areas: "label out" "input input"; align-items: center; column-gap: 8px; }
+  .control label { grid-area: label; font-size: 13px; }
+  .control output { grid-area: out; font: 600 13px var(--mono); }
+  .control input { grid-area: input; width: 100%; min-height: 28px; accent-color: var(--onhand); font: inherit; color: inherit; }
+  .control input[type=number] { padding: 4px 6px; border: 1px solid var(--rule); border-radius: 5px; background: var(--ground); }
+  .control input:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  #changed { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
+  #changed:empty { display: none; }
+  #reset { margin-top: 8px; padding: 6px 12px; font: inherit; font-size: 13px; color: var(--ink); background: var(--ground); border: 1px solid var(--rule); border-radius: 999px; cursor: pointer; }
+  #reset:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+  summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; margin-top: 6px; font-size: 12px; min-width: 100%; }
+  th, td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  th[scope=col] { font-weight: 600; color: var(--muted); }
+  th[scope=row], th[scope=col]:first-child { text-align: left; }
+  #error { margin: 10px 0 0; color: var(--short); font-size: 13px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Hiring plan</p>
+  <h1 id="headline" aria-live="polite">Loading the plan</h1>
+  <p id="sub"></p>
+  <figure id="chart-wrap">
+    <svg id="chart" tabindex="0" role="img" aria-labelledby="chart-title chart-desc"></svg>
+    <figcaption id="tip" aria-live="polite">Point at a month, or focus the chart and use the arrow keys, to read that month.</figcaption>
+  </figure>
+  <section id="controls" aria-labelledby="controls-h">
+    <h2 id="controls-h">Try other numbers</h2>
+    <div id="control-list"></div>
+    <p id="changed" aria-live="polite"></p>
+    <button id="reset" type="button" hidden>Back to the original numbers</button>
+  </section>
+  <details>
+    <summary>Show the numbers</summary>
+    <div class="table-wrap"><table id="table"></table></div>
+  </details>
+  <p id="error" role="alert" hidden></p>
+</main>
+<!--SCRIPT-->
+</body>
+</html>
