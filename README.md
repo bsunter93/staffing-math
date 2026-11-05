@@ -134,8 +134,8 @@ node dist/staffing-math.mjs --http --port 3000
 
 It listens on `http://127.0.0.1:3000/mcp`. Put it behind HTTPS (a host, a reverse proxy, or a tunnel such as `cloudflared tunnel --url http://localhost:3000`), then add `https://your-host/mcp` as a connector with no authentication:
 
-- ChatGPT: Plugins, then Add, then Add custom MCP server. ChatGPT draws the plan view.
-- Gemini: Settings, Connectors, then Custom. Gemini shows the text answers.
+- ChatGPT: [Plugins](https://chatgpt.com/plugins), then Add, then Add custom MCP server, with no authentication. ChatGPT draws the plan view. After an update, Refresh tools in the plugin's settings picks up new inputs.
+- Gemini: [Connectors](https://gemini.google.com/customize/connectors), then Custom. Gemini shows the text answers.
 - Claude: Settings, Connectors, Add custom connector. Use `--host 0.0.0.0` when it runs on a server.
 
 The HTTP mode is stateless. Each request gets a fresh server, so it scales out without sessions.
