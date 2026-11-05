@@ -12,6 +12,8 @@ In Claude and ChatGPT, `hiring_plan` also draws its answer: FTE needed against F
 
 The math is the engine from the [Operating Model Simulator](https://github.com/bsunter93/operating-model-simulator), copied unchanged into `vendor/` along with its own tests.
 
+To use it without installing anything, add `https://staffing-math.vercel.app/mcp` as a connector. Steps and examples: [bensunter.com/staffing-math.html](https://bensunter.com/staffing-math.html).
+
 ## Worked example
 
 > I handle 4,000 cases a week at 12 minutes each with 30% shrinkage. How many people do I need, and what's my hiring plan if volume grows 5% a month?
