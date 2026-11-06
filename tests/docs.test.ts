@@ -49,10 +49,11 @@ describe('docs', () => {
 });
 
 describe('release metadata', () => {
-  it('package.json, the Claude plugin, the Desktop extension and the Gemini extension carry one version', () => {
+  it('package.json, the Claude plugin, the Desktop extension, the Gemini extension and the registry entry carry one version', () => {
     const v = (f: string) => JSON.parse(readFileSync(f, 'utf8')).version;
     expect(v('.claude-plugin/plugin.json')).toBe(v('package.json'));
     expect(v('manifest.json')).toBe(v('package.json'));
     expect(v('gemini-extension.json')).toBe(v('package.json'));
+    expect(v('server.json')).toBe(v('package.json'));
   });
 });
