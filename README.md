@@ -122,7 +122,7 @@ gemini extensions install https://github.com/bsunter93/staffing-math
 
 ### ChatGPT, Gemini and Claude custom connectors
 
-These connect to a remote server over Streamable HTTP at a public HTTPS URL. The hosted one is free to use, needs no sign-in and stores nothing:
+These connect to a remote server over Streamable HTTP at a public HTTPS URL. The hosted one is free to use and needs no sign-in. It saves none of your numbers; it counts calls by day, app and tool (see [Usage counts](#usage-counts)):
 
 ```text
 https://staffing-math.vercel.app/mcp
@@ -163,6 +163,12 @@ npx vercel deploy --prod
 Fractions are fractions: 0.30 means 30%. A value of 30 for shrinkage is rejected with a message saying so.
 
 Every result has a text block for the model and a `structuredContent` copy with the same numbers, the inputs and the steps. All three tools are read-only, make no network calls and store nothing.
+
+## Usage counts
+
+The hosted server at `staffing-math.vercel.app` adds one to a counter for each request: the day (UTC), the app (the first word of its User-Agent, such as `openai-mcp`) and what it asked for (`initialize`, `tools_list`, a tool name, or `view`). It also counts the app name a client sends when it connects. It never saves tool inputs, results, IP addresses or full User-Agent strings. The counts are public at [`/stats`](https://staffing-math.vercel.app/stats).
+
+Counting runs only when an Upstash Redis REST URL and token are set (`KV_REST_API_URL` and `KV_REST_API_TOKEN`, or the `UPSTASH_REDIS_REST_` pair). Your own copy, over stdio or HTTP, counts nothing. If the store is slow or down, the answer still goes out; see `src/usage.ts`.
 
 ## The plan view
 
