@@ -97,7 +97,7 @@ The tool descriptions tell the model to name assumed inputs back to the user.
 
 - Any fetch-handler host (Vercel, Cloudflare Workers, Deno, Bun) through `api/index.mjs` / `src/fetch.ts`.
 
-No network calls, no accounts, no stored data. All three tools are read-only.
+No network calls, no accounts, no stored data. All three tools are read-only. The hosted deployment adds per-day usage counts (day, app, tool) and nothing else; see the README section "Usage counts".
 
 ## Out of scope for v1
 
