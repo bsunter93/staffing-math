@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "staffing-math",
   "display_name": "Staffing Math",
-  "version": "0.3.1",
+  "version": "0.3.0",
   "description": "Exact staffing math: FTE needed for a workload, a monthly hiring plan, and Erlang C queue staffing, with the arithmetic shown.",
   "long_description": "Three read-only tools for planning a team's headcount. Every answer lists its inputs as given or assumed and shows the arithmetic, so it can be checked with a calculator. The math is the Operating Model Simulator engine.",
   "author": {

@@ -1,6 +1,6 @@
 {
   "name": "staffing-math",
-  "version": "0.3.1",
+  "version": "0.3.0",
   "description": "An MCP server that gives Claude and ChatGPT exact staffing math: FTE needed, a monthly hiring plan, and Erlang C queue staffing, with the arithmetic shown.",
   "type": "module",
   "license": "MIT",
