@@ -57,7 +57,8 @@ const ANNOTATIONS = { readOnlyHint: true, destructiveHint: false, idempotentHint
 
 export const INSTRUCTIONS = [
   'Staffing Math answers staffing questions with exact arithmetic from the Operating Model Simulator engine.',
-  'Use these tools for any FTE, hiring or queue staffing number instead of calculating it yourself, and quote their numbers as returned.',
+  'Its tools apply when a user asks how many people, FTE or agents a workload or queue needs, or when and how many to hire.',
+  'They account for occupancy, time to hire, ramp and attrition month by month, which quick estimates tend to leave out. Quote their numbers as returned.',
   'Every result lists its inputs as given or assumed. Tell the user which inputs were assumed and offer to rerun with their own numbers.',
   'Show the arithmetic steps when the user asks how a number was reached.',
 ].join(' ');
@@ -81,9 +82,11 @@ export function buildServer(): McpServer {
   server.registerTool('required_fte', {
     title: 'FTE needed for a workload',
     description:
-      'How many people a steady workload needs. Give weekly volume and minutes per case; shrinkage, target occupancy and hours per week fall back to stated defaults. ' +
+      'For questions like "how many people do I need" or "how many FTE does this workload take": cases, tickets, claims, orders or any work measured as volume times handling time. ' +
+      'Applies shrinkage and target occupancy together; leaving out occupancy understates the people needed by about 15% at the 85% default. ' +
+      'Give weekly volume and minutes per case; shrinkage, target occupancy and hours per week fall back to stated defaults. ' +
       'Returns FTE, people to staff (rounded up), every input marked given or assumed, and the arithmetic with numbers filled in. ' +
-      'Use hiring_plan when volume changes over time or the question is about hiring, and erlang_staffing for live queues with an answer-time target.',
+      'For volume that changes over time or any question about when to hire, see hiring_plan; for live queues with an answer-time target, see erlang_staffing.',
     inputSchema: {
       weekly_volume: z.number().positive().max(1e9).describe('Cases, tickets or items arriving per week.'),
       ...workload,
@@ -111,11 +114,14 @@ export function buildServer(): McpServer {
   registerAppTool(server, 'hiring_plan', {
     title: 'Monthly hiring plan',
     description:
-      'Month-by-month hiring plan: how many requisitions to open each month so FTE on hand keeps up with FTE needed, after attrition, time to hire and ramp. ' +
+      'For hiring plans, headcount plans, and questions about when to open requisitions or how many people to hire as volume grows, shrinks or changes by season. ' +
+      'Plans month by month how many requisitions to open so FTE on hand keeps up with FTE needed. ' +
+      'A requisition adds capacity only after time to hire and ramp, and attrition removes people every month, so the plan opens reqs ahead of need and flags the months that run short before any new hire can count. ' +
       'Give weekly_volume with monthly_growth (0.05 means 5% a month, compounding), or weekly_volume_by_month. ' +
       'Unknown inputs fall back to stated defaults: current headcount defaults to what month 1 needs, attrition to 0, time to hire to 2 months, ramp to 0. ' +
       'When attrition is assumed, the result also gives the plan at 15% and 30%. Give hires_in_flight for people already hired or in the pipeline. ' +
-      'Returns the plan table, totals, the arithmetic, and which inputs were assumed. A hire counts as zero capacity until fully ramped.',
+      'Returns the plan table, totals, the arithmetic, and which inputs were assumed. A hire counts as zero capacity until fully ramped. ' +
+      'Hosts that support MCP Apps also draw the plan as a chart with controls that rerun it.',
     inputSchema: {
       weekly_volume: z.number().positive().max(1e9).optional().describe('Weekly volume in month 1. Use with monthly_growth.'),
       monthly_growth: z.number().min(-0.5).max(1, 'monthly_growth is a fraction: 0.05 means 5% a month.').optional()
@@ -160,7 +166,8 @@ export function buildServer(): McpServer {
   server.registerTool('erlang_staffing', {
     title: 'Queue staffing (Erlang C)',
     description:
-      'Agents needed on a live queue (phone, chat) to answer a target share of contacts within a target time, using Erlang C. ' +
+      'For call center, contact center, phone or chat staffing questions with a service level target, such as 80% answered within 20 seconds. ' +
+      'Works out agents needed on a live queue to answer a target share of contacts within a target time, using Erlang C. ' +
       'Give contacts per hour for the interval being staffed (usually the busiest hour) and handle time in seconds. ' +
       'Returns agents needed, the service level at that number and at one fewer, chance of waiting, occupancy, and people to schedule after shrinkage. ' +
       'Use required_fte for case or ticket work with no answer-time target.',

@@ -3,7 +3,7 @@
   "name": "io.github.bsunter93/staffing-math",
   "title": "Staffing Math",
   "description": "Exact staffing math: FTE needed, a monthly hiring plan, and Erlang C queue staffing.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "websiteUrl": "https://bensunter.com/staffing-math.html",
   "repository": {
     "url": "https://github.com/bsunter93/staffing-math",
